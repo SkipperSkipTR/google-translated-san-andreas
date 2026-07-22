@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import time
+import json
+import random
+import re
+import signal
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+from supabase import create_client
+from deep_translator import GoogleTranslator
+from tqdm import tqdm
+
+# Load environment variables from .env file if present
+_env_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("⚠️ Warning: SUPABASE_URL and SUPABASE_KEY environment variables are required.")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
+
+WORKER_ID = f"worker-{os.getpid()}"
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", 3))
+
+# --- UPGRADE: Hardcoded target batches ---
+TARGET_BATCHES = [1, 3, 5, 7, 10]
+ITERATION_COUNTS = [3, 5, 20, 50, 100]
+
+SEPARATOR = "\n"
+
+_active_tasks = []
+_active_batch = None
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+ALL_LANG_CODES = list(
+    GoogleTranslator().get_supported_languages(as_dict=True).values()
+)
+
+# ─────────────────────────────────────────────
+
+def get_table(batch):
+    return f"tasks_b{batch}"
+
+def get_rpc(batch):
+    return f"claim_tasks_b{batch}"
+
+def strip_gxt_tags(text):
+    return re.sub(r'~[a-zA-Z0-9_]+~', '', text).strip()
+
+def is_translatable(text):
+    return bool(re.search(r'[a-zA-Z]', text))
+
+# ─────────────────────────────────────────────
+
+def _translate(source, target, text, retries=8):
+    delay = 2
+
+    for attempt in range(retries):
+        try:
+            result = GoogleTranslator(
+                source=source,
+                target=target
+            ).translate(text)
+
+            if result:
+                return result
+
+        except Exception:
+            pass
+
+        time.sleep(delay)
+        delay *= 1.5
+
+    raise RuntimeError("Translation failed")
+
+# ─────────────────────────────────────────────
+
+def translate_text(text, iterations):
+    current = text
+    current_lang = "en"
+
+    langs = random.sample(
+        [l for l in ALL_LANG_CODES if l != "en"],
+        min(iterations, len(ALL_LANG_CODES)-1)
+    )
+
+    for lang in langs:
+        current = _translate(current_lang, lang, current)
+        current_lang = lang
+
+    return _translate(current_lang, "en", current)
+
+# ─────────────────────────────────────────────
+
+def upload_tasks(entries, batch):
+    table = get_table(batch)
+    CHUNK_SIZE = 100  # safe size for URL query parameter
+
+    key_to_text = {k: strip_gxt_tags(t) for k, t in entries}
+    all_keys = list(key_to_text.keys())
+
+    existing_keys = set()
+    for i in range(0, len(all_keys), CHUNK_SIZE):
+        chunk = all_keys[i:i+CHUNK_SIZE]
+        res = supabase.table(table)\
+            .select("key")\
+            .in_("key", chunk)\
+            .execute()
+        existing_keys.update(r["key"] for r in res.data)
+
+    new_entries = [
+        {"key": k, "original_text": key_to_text[k], "status": "pending"}
+        for k in all_keys if k not in existing_keys
+    ]
+
+    skipped = len(entries) - len(new_entries)
+    if skipped:
+        print(f"⚠️  Skipped {skipped} already‑existing keys in {table}.")
+
+    if not new_entries:
+        print(f"✅ All keys already present in {table} — nothing to insert.")
+        return
+
+    for i in range(0, len(new_entries), CHUNK_SIZE):
+        chunk = new_entries[i:i+CHUNK_SIZE]
+        supabase.table(table).insert(chunk).execute()
+
+    print(f"✅ Inserted {len(new_entries)} new tasks into {table}.")
+
+# ─────────────────────────────────────────────
+
+def claim_tasks(batch, batch_size):
+    rpc = get_rpc(batch)
+
+    res = supabase.rpc(rpc, {
+        "batch_size": batch_size,
+        "worker_id": WORKER_ID
+    }).execute()
+
+    return res.data or []
+
+# ─────────────────────────────────────────────
+
+def complete_task(task_id, result, batch):
+    table = get_table(batch)
+
+    supabase.table(table).update({
+        "status": "done",
+        "result": result,
+        "updated_at": "now()"
+    }).eq("id", task_id).execute()
+
+# ─────────────────────────────────────────────
+
+def process_task_group(tasks):
+    keys = [t["key"] for t in tasks]
+    texts = [t["original_text"] for t in tasks]
+
+    results = {k: {} for k in keys}
+
+    # The actual job we will hand to the parallel workers
+    def _do_iteration(it):
+        try:
+            joined = SEPARATOR.join(texts)
+            translated = translate_text(joined, it)
+            parts = translated.split(SEPARATOR)
+
+            if len(parts) < len(texts):
+                parts += [""] * (len(texts) - len(parts))
+
+            return str(it), parts[:len(texts)]
+        except Exception as e:
+            return str(it), [f"[Error: {e}]"] * len(texts)
+
+    # Hand the different iterations (3, 5, 20, 50, 100) to the workers simultaneously
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_it = {executor.submit(_do_iteration, it): it for it in ITERATION_COUNTS}
+        
+        # As each thread finishes its specific hop count, save the results
+        for future in as_completed(future_to_it):
+            it_str, parts = future.result()
+            for k, t in zip(keys, parts):
+                results[k][it_str] = t.strip()
+
+    return [(t["id"], results[t["key"]]) for t in tasks]
+
+# ─────────────────────────────────────────────
+# GRACEFUL SHUTDOWN
+# ─────────────────────────────────────────────
+
+def release_tasks():
+    """Reset in-progress tasks back to pending so another worker can pick them up."""
+    global _active_tasks, _active_batch
+    if not _active_tasks or _active_batch is None:
+        return
+        
+    table = get_table(_active_batch)
+    ids = [t["id"] for t in _active_tasks]
+    
+    print(f"\n🛑 Ctrl+C detected! Releasing {len(ids)} stuck task(s) back to pending...")
+    try:
+        supabase.table(table).update({
+            "status": "pending"
+            # If your database has 'claimed_by' or 'claimed_at' columns, 
+            # you can set them to None here as well:
+            # "claimed_by": None,
+            # "claimed_at": None,
+        }).in_("id", ids).execute()
+        print("✅ Tasks successfully released. Safe to shut down.")
+    except Exception as e:
+        print(f"❌ Could not release tasks: {e}")
+
+def _handle_sigint(signum, frame):
+    release_tasks()
+    sys.exit(0)
+
+# ─────────────────────────────────────────────
+
+def worker_loop():
+    global _active_tasks, _active_batch
+    
+    # --- Intercept Ctrl+C ---
+    signal.signal(signal.SIGINT, _handle_sigint)
+    signal.signal(signal.SIGTERM, _handle_sigint)
+
+    print(f"🚀 Multi-Batch Worker {WORKER_ID} Started")
+    print(f"   Target Queue: Batches {TARGET_BATCHES}")
+    print(f"   (Ctrl+C will safely release in-progress tasks)\n")
+    
+    for batch in TARGET_BATCHES:
+        _active_batch = batch  # Remember which batch we are on for Ctrl+C
+        
+        print("\n" + "="*60)
+        print(f"🔄 SWITCHING TO BATCH {batch}")
+        print("="*60)
+        
+        table = get_table(batch)
+
+        try:
+            total_res = supabase.table(table).select("id", count="exact").execute()
+            total_tasks = total_res.count if total_res.count else 0
+            
+            done_res = supabase.table(table).select("id", count="exact").eq("status", "done").execute()
+            completed = done_res.count if done_res.count else 0
+        except Exception as e:
+            print(f"⚠️ Could not fetch progress counts for batch {batch}: {e}")
+            total_tasks = 100
+            completed = 0
+
+        pbar = tqdm(total=total_tasks, initial=completed, desc=f"Batch {batch} Progress", unit="line")
+
+        while True:
+            tasks = claim_tasks(batch, batch)
+
+            if not tasks:
+                pbar.write(f"\n🎉 Batch {batch} is complete! No pending tasks left in this table.")
+                pbar.close()
+                break 
+
+            # --- Remember these tasks in case we get killed ---
+            _active_tasks = tasks
+            
+            pbar.write(f"\n📦 Claimed {len(tasks)} task(s), translating as one batch...")
+
+            task_results = process_task_group(tasks)
+            task_dict = {t["id"]: t for t in tasks}
+
+            for task_id, result in task_results:
+                try:
+                    complete_task(task_id, result, batch)
+                    
+                    original_text = task_dict[task_id]["original_text"]
+                    key = task_dict[task_id]["key"]
+                    
+                    pbar.write(f"\n  ✓ Line {key} saved:")
+                    pbar.write(f"      Original: \"{original_text}\"")
+                    for iterations, translated_text in result.items():
+                        pbar.write(f"      {iterations} hops: \"{translated_text}\"")
+                    pbar.write("      " + "-" * 40)
+                    
+                except Exception as e:
+                    pbar.write(f"  ❌ Could not save result for task {task_id}: {e}")
+                
+                pbar.update(1)
+
+            # --- Clear the memory, we finished them safely! ---
+            _active_tasks = []
+
+            try:
+                done_res = supabase.table(table).select("id", count="exact").eq("status", "done").execute()
+                actual_completed = done_res.count if done_res.count else pbar.n
+                
+                pbar.n = actual_completed
+                pbar.refresh()
+                
+                pbar.write(f"\n📊 BATCH {batch} COMPLETE | Progress: {actual_completed} / {total_tasks} translated.\n")
+                
+            except Exception as e:
+                pbar.write(f"  ⚠️ Could not sync final batch count with database: {e}")
+
+    print("\n" + "🏆"*20)
+    print(f" ALL TARGET BATCHES {TARGET_BATCHES} ARE FULLY TRANSLATED!")
+    print(" Shutting down worker gracefully. Goodbye!")
+    print("🏆"*20 + "\n")
+
+# ─────────────────────────────────────────────
+
+def export_results(output_file_base):
+    base_name, ext = os.path.splitext(output_file_base)
+
+    for batch in TARGET_BATCHES:
+        print(f"📥 Exporting Batch {batch}...")
+        
+        # 1. Create a fresh dictionary for THIS batch specifically
+        batch_data = {
+            "version": 2,
+            "iterations": ITERATION_COUNTS,
+            "entries": {}
+        }
+
+        table = get_table(batch)
+
+        # Fetch all completed rows from Supabase using pagination (default PostgREST limit is 1000)
+        PAGE_SIZE = 1000
+        start = 0
+        all_rows = []
+
+        while True:
+            res = supabase.table(table)\
+                .select("*")\
+                .eq("status", "done")\
+                .range(start, start + PAGE_SIZE - 1)\
+                .execute()
+
+            rows = res.data or []
+            if not rows:
+                break
+
+            all_rows.extend(rows)
+            if len(rows) < PAGE_SIZE:
+                break
+
+            start += PAGE_SIZE
+
+        # Populate the entries
+        for row in all_rows:
+            batch_data["entries"][row["key"]] = row["result"]
+
+        # 2. Generate a unique filename (e.g., candidates/batch_1.json)
+        if os.path.isdir(output_file_base):
+            batch_output_file = os.path.join(output_file_base, f"batch_{batch}.json")
+        elif re.search(r'batch_\d+$', base_name):
+            batch_output_file = f"{re.sub(r'\d+$', str(batch), base_name)}{ext or '.json'}"
+        elif base_name.endswith("batch_"):
+            batch_output_file = f"{base_name}{batch}{ext or '.json'}"
+        elif base_name.endswith("_") or base_name.endswith("/") or base_name.endswith("\\"):
+            batch_output_file = f"{base_name}batch_{batch}{ext or '.json'}"
+        else:
+            batch_output_file = f"{base_name}_batch_{batch}{ext or '.json'}"
+
+        out_dir = os.path.dirname(batch_output_file)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        # 3. Write just this batch's data to its specific file
+        with open(batch_output_file, "w", encoding="utf-8") as f:
+            json.dump(batch_data, f, ensure_ascii=False, indent=2)
+            
+        print(f"✅ Batch {batch} exported ({len(batch_data['entries'])} entries) to {batch_output_file}")
+
+    print("\n🎉 All batches successfully exported to their respective files!")
+
+# ─────────────────────────────────────────────
+
+def load_localization(path):
+    entries = []
+
+    with open(path, "r", encoding="utf-16-le") as f:
+        lines = f.readlines()
+
+    i = 0
+
+    while i < len(lines):
+        line = lines[i].strip()
+
+        if line.startswith("[") and line.endswith("]"):
+            key = line
+            text = lines[i+1].strip()
+
+            entries.append((key, text))
+
+            i += 2
+        else:
+            i += 1
+
+    return entries
+
+# ─────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # --- UPGRADE: Removed --batch from all commands ---
+    init = sub.add_parser("init")
+    init.add_argument("file")
+
+    worker = sub.add_parser("worker")
+
+    export = sub.add_parser("export")
+    export.add_argument("--out", required=True)
+
+    args = parser.parse_args()
+
+    if args.cmd == "init":
+        entries = load_localization(args.file)
+        # Apply init file to all hardcoded batches
+        for batch in TARGET_BATCHES:
+            print(f"\n🚀 Initializing Batch {batch}...")
+            upload_tasks(entries, batch)
+
+    elif args.cmd == "worker":
+        worker_loop()
+
+    elif args.cmd == "export":
+        export_results(args.out)
+
+if __name__ == "__main__":
+    main()
