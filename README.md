@@ -1,4 +1,6 @@
-# GTA: San Andreas - Google Translated Mod (v2) ⟳
+# GTA: San Andreas - Google Translated Mod (v2)
+
+(This readme is AI slop but it conveys what the project is and how I work with the files in the repository well enough, so I don't really care. Once I publish the mod I will update the readme.)
 
 Development repository for **Google Translated San Andreas v2** — the second generation total script overhaul for *Grand Theft Auto: San Andreas*. 
 
