@@ -1246,6 +1246,8 @@ class HyperTranslationApp:
                     self.on_tree_select(None)
                     break
         self.refresh_tree(self.search_var.get())
+        self.update_committed_count()
+        self.save_session()
         self.status_var.set("Skipped")
 
     def commit_entry(self):
